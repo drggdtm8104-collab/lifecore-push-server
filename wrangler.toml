@@ -1,0 +1,10 @@
+name = "lifecore-push"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[kv_namespaces]]
+binding = "SUBS"
+id = "a99c4d08c95f44d099cc87cb25db2a17"
