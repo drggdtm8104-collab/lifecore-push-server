@@ -4,6 +4,9 @@
 // - POST /unsubscribe   : 購読を解除する（同期していたタスクの一覧も一緒に消す）
 // - POST /today-digest  : 今日の「時間が決まっている・まだ終わっていないタスク」の
 //                         id・名前・時刻一覧を保存する（通知オン時のみクライアントから送られる）
+// - POST /task-event    : タスクの完了・取り消しをMyQuest（別の自作アプリ）へ知らせる中継
+//                         （v3.167〜。MyQuestのアクセス合鍵はこのWorkerだけが持ち、
+//                         LifeCore本体のコードには一切置かない）
 // - 1分おき（cron）に、時刻が来た・まだ通知していないタスクを1件ずつ個別に通知する（scheduled）。
 //
 // v3.118（Phase 4）: 「毎朝8時にまとめて1通」（Phase 1〜3）は廃止し、時間指定
@@ -47,6 +50,14 @@ export default {
       const sub = await request.json().catch(() => null);
       if (!sub || !sub.endpoint) return new Response("bad request", { status: 400, headers: corsHeaders() });
       const id = await sha256Hex(sub.endpoint);
+      // このアプリは1人運用前提——購読は常に1件だけであるべき。再追加などで
+      // 古い購読が残ったまま新しい購読が増えると、1件のタスク通知が購読数
+      // 分だけ重複して届く不具合になる（実際に発生・確認済み）。新しい購読を
+      // 保存する前に、それ以外の古い購読を全部消す。
+      const existing = await env.SUBS.list({ prefix: "sub:" });
+      await Promise.all(
+        existing.keys.filter((k) => k.name !== "sub:" + id).map((k) => env.SUBS.delete(k.name))
+      );
       await env.SUBS.put("sub:" + id, JSON.stringify(sub));
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders({ "content-type": "application/json" }) });
     }
@@ -80,6 +91,23 @@ export default {
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders({ "content-type": "application/json" }) });
     }
 
+    // v3.167: LifeCoreでタスクを完了・取り消ししたら、MyQuest（別の自作アプリ）へ
+    // 知らせを中継する。クライアントはこのWorkerの既存のSHARED_SECRETで認証する
+    // だけで済み、MyQuest自体のアクセス合鍵（CF-Access-Client-Id/Secret）は
+    // ここ（Worker側のenv経由）にしか置かない。即時転送を試み、失敗したら
+    // pendingキューに積んで1分おきのcron（flushPendingMyQuestEvents）で送り直す
+    // ——オフライン・MyQuest側の一時停止などで届かなかった分を消さないため。
+    if (url.pathname === "/task-event" && request.method === "POST") {
+      if (auth !== env.SHARED_SECRET) return new Response("unauthorized", { status: 401, headers: corsHeaders() });
+      const body = await request.json().catch(() => null);
+      const err = validateTaskEvent(body);
+      if (err) return new Response(err, { status: 400, headers: corsHeaders() });
+      const evt = { id: body.id, type: body.type, task: body.task, title: body.title, at: body.at };
+      const ok = await forwardToMyQuest(env, evt).catch(() => false);
+      if (!ok) await queuePendingMyQuestEvent(env, evt);
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders({ "content-type": "application/json" }) });
+    }
+
     // 動作確認用: 時刻を待たずに、今すぐ全購読者へ固定文言のテスト通知を1通送る。
     // 本番の通知経路（VAPID署名・暗号化・送信）をそのまま通るため、
     // ここが通れば scheduled() 側も同じ仕組みで動く。時間指定タスクの個別通知
@@ -95,8 +123,64 @@ export default {
 
   async scheduled(event, env, ctx) {
     await checkAndSendDueTasks(env, event.scheduledTime);
+    await flushPendingMyQuestEvents(env);
   },
 };
+
+// ---------- MyQuest連携（v3.167〜） ----------
+// id・taskは半角英数と . _ : - のみ、idは100字まで、taskは64字まで（MyQuest側の規約）。
+const MYQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,100}$/;
+const MYQUEST_TASK_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+function validateTaskEvent(b) {
+  if (!b) return "bad request";
+  if (typeof b.id !== "string" || !MYQUEST_ID_RE.test(b.id)) return "bad id";
+  if (b.type !== "task.completed" && b.type !== "task.uncompleted") return "bad type";
+  if (typeof b.task !== "string" || !MYQUEST_TASK_RE.test(b.task)) return "bad task";
+  if (typeof b.title !== "string" || b.title.length === 0 || b.title.length > 100) return "bad title";
+  if (typeof b.at !== "string" || Number.isNaN(Date.parse(b.at))) return "bad at";
+  return null;
+}
+async function forwardToMyQuest(env, evt) {
+  try {
+    const res = await fetch("https://myquest.dr-ggdtm8104.workers.dev/api/hook/lifecore", {
+      method: "POST",
+      headers: {
+        "CF-Access-Client-Id": env.MYQUEST_CLIENT_ID,
+        "CF-Access-Client-Secret": env.MYQUEST_CLIENT_SECRET,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(evt),
+    });
+    return res.ok;
+  } catch (e) {
+    console.error("myquest forward failed", e);
+    return false;
+  }
+}
+// 転送に失敗した分を1件ずつ覚えておき、cronで再送する。同じid+typeは重複して
+// 積まない（MyQuest側もidで重複排除するので安全だが、キューを無駄に太らせない）。
+async function queuePendingMyQuestEvent(env, evt) {
+  const raw = await env.SUBS.get("myquest:pending");
+  let list = [];
+  if (raw) { try { list = JSON.parse(raw); } catch { list = []; } }
+  const key = evt.id + ":" + evt.type;
+  if (!list.some((e) => e.id + ":" + e.type === key)) list.push(evt);
+  await env.SUBS.put("myquest:pending", JSON.stringify(list));
+}
+async function flushPendingMyQuestEvents(env) {
+  const raw = await env.SUBS.get("myquest:pending");
+  if (!raw) return;
+  let list;
+  try { list = JSON.parse(raw); } catch { return; }
+  if (!Array.isArray(list) || list.length === 0) return;
+  const stillPending = [];
+  for (const evt of list) {
+    const ok = await forwardToMyQuest(env, evt).catch(() => false);
+    if (!ok) stillPending.push(evt);
+  }
+  if (stillPending.length > 0) await env.SUBS.put("myquest:pending", JSON.stringify(stillPending));
+  else await env.SUBS.delete("myquest:pending");
+}
 
 // cron は * * * * *（1分おき）で起動する。保存されている今日ぶんの時間指定
 // タスクのうち、時刻が来ていてまだ通知していないものを1件ずつ個別に送る。
@@ -168,7 +252,10 @@ async function checkAndSendDueTasks(env, scheduledTime, send = sendToAll) {
     sent.add(sentKeyForTask);
     changed = true;
     if (diff <= GRACE_MIN) {
-      await send(env, `${task.name} の時間です`);
+      // tagにid+時刻を指定——プッシュサービス側の再送（同じ内容が複数回届く
+      // ことがある）が起きても、端末側では「同じ通知の更新」として1件に
+      // まとまり、何通も積み重なるのを防ぐ。
+      await send(env, `${task.name} の時間です`, sentKeyForTask);
     }
   }
 
@@ -177,7 +264,7 @@ async function checkAndSendDueTasks(env, scheduledTime, send = sendToAll) {
   }
 }
 
-async function sendToAll(env, body) {
+async function sendToAll(env, body, tag) {
   const vapid = {
     subject: "mailto:" + env.CONTACT_EMAIL,
     publicKey: env.VAPID_PUBLIC_KEY,
@@ -200,7 +287,7 @@ async function sendToAll(env, body) {
       // 形で発生を確認）。睡眠時間（7〜9時間程度）をまたいでも配信を
       // 保持できるよう12時間に設定し、端末が起きたタイミングで配信
       // されるようにする。
-      const payload = await buildPushPayload({ data: { title: "LifeCore", body }, options: { urgency: "high", ttl: 60 * 60 * 12 } }, sub, vapid);
+      const payload = await buildPushPayload({ data: { title: "LifeCore", body, tag }, options: { urgency: "high", ttl: 60 * 60 * 12 } }, sub, vapid);
       const res = await fetch(sub.endpoint, payload);
       if (res.status === 404 || res.status === 410) {
         await env.SUBS.delete(key.name);
