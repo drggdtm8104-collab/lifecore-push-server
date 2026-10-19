@@ -151,9 +151,16 @@ async function forwardToMyQuest(env, evt) {
       },
       body: JSON.stringify(evt),
     });
+    // v3.167フォローアップ: 例外が起きなかった場合（MyQuestが400/401などを
+    // 返しただけ）は元のコードだと何も記録されず、wrangler tailで原因が
+    // 一切見えなかった——合鍵の値そのものは出さず、ステータスと本文だけ記録する。
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error("myquest forward not ok", res.status, text.slice(0, 300), "id=" + evt.id, "type=" + evt.type);
+    }
     return res.ok;
   } catch (e) {
-    console.error("myquest forward failed", e);
+    console.error("myquest forward failed", e, "id=" + evt.id, "type=" + evt.type);
     return false;
   }
 }
