@@ -1,6 +1,10 @@
 name = "lifecore-push"
 main = "worker.js"
 compatibility_date = "2024-09-23"
+# 同じCloudflareアカウント内のworkers.dev同士のfetchは既定だとブロックされる
+# （Error 1042）。MyQuest（別のWorker、同アカウント）への転送がこれで失敗
+# していたため追加（v3.167フォローアップ）。
+compatibility_flags = ["global_fetch_strictly_public"]
 
 [triggers]
 crons = ["* * * * *"]
