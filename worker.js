@@ -102,7 +102,7 @@ export default {
       const body = await request.json().catch(() => null);
       const err = validateTaskEvent(body);
       if (err) return new Response(err, { status: 400, headers: corsHeaders() });
-      const evt = { id: body.id, type: body.type, task: body.task, title: body.title, at: body.at };
+      const evt = { id: body.id, type: body.type, task: body.task, title: body.title, weight: body.weight ?? null, at: body.at };
       const ok = await forwardToMyQuest(env, evt).catch(() => false);
       if (!ok) await queuePendingMyQuestEvent(env, evt);
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders({ "content-type": "application/json" }) });
@@ -137,6 +137,9 @@ function validateTaskEvent(b) {
   if (b.type !== "task.completed" && b.type !== "task.uncompleted") return "bad type";
   if (typeof b.task !== "string" || !MYQUEST_TASK_RE.test(b.task)) return "bad task";
   if (typeof b.title !== "string" || b.title.length === 0 || b.title.length > 100) return "bad title";
+  // v3.181: タスクに登録した「負荷の重み」。整数のみ・上限下限なし
+  // （LifeCore側の仕様どおり）。未登録のタスク（nullを送ってくる）も許容。
+  if (b.weight !== undefined && b.weight !== null && !Number.isInteger(b.weight)) return "bad weight";
   if (typeof b.at !== "string" || Number.isNaN(Date.parse(b.at))) return "bad at";
   return null;
 }
